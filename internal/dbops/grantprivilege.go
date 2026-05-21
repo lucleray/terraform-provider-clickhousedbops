@@ -41,6 +41,7 @@ type GrantPrivilege struct {
 	GranteeUserName *string `json:"user_name"`
 	GranteeRoleName *string `json:"role_name"`
 	GrantOption     bool    `json:"grant_option"`
+	IsPartialRevoke bool    `json:"is_partial_revoke"`
 	// ExpandedAccessTypes includes AccessType and all its descendants.
 	// ClickHouse may expand a parent privilege (e.g. CREATE, ACCESS MANAGEMENT)
 	// into its children in system.grants instead of storing a single parent row.
@@ -117,6 +118,7 @@ func ClassicGrantMatcher(ctx context.Context, priv *GrantPrivilege, clusterName 
 		valOrNullWhere("database", dbName),
 		valOrNullWhere("table", tblName),
 		valOrNullWhere("column", priv.ColumnName),
+		querybuilder.WhereEquals("is_partial_revoke", 0),
 	}
 	if priv.GranteeUserName != nil {
 		where = append(where, querybuilder.WhereEquals("user_name", *priv.GranteeUserName))
@@ -135,6 +137,7 @@ func ClassicGrantMatcher(ctx context.Context, priv *GrantPrivilege, clusterName 
 			querybuilder.NewField("user_name"),
 			querybuilder.NewField("role_name"),
 			querybuilder.NewField("grant_option"),
+			querybuilder.NewField("is_partial_revoke"),
 		},
 		"system.grants",
 	).WithCluster(clusterName).Where(where...).Build()
@@ -172,6 +175,10 @@ func ClassicGrantMatcher(ctx context.Context, priv *GrantPrivilege, clusterName 
 		if err != nil {
 			return errors.WithMessage(err, "error scanning query result, missing 'grant_option' field")
 		}
+		_, err = data.GetBool("is_partial_revoke")
+		if err != nil {
+			return errors.WithMessage(err, "error scanning query result, missing 'is_partial_revoke' field")
+		}
 		found = true
 		return nil
 	})
@@ -195,6 +202,7 @@ func SourcesReadWriteGrantMatcher(ctx context.Context, priv *GrantPrivilege, clu
 		valOrNullWhere("database", priv.DatabaseName),
 		valOrNullWhere("table", priv.TableName),
 		valOrNullWhere("column", priv.ColumnName),
+		querybuilder.WhereEquals("is_partial_revoke", 0),
 	}
 	if priv.GranteeUserName != nil {
 		where = append(where, querybuilder.WhereEquals("user_name", *priv.GranteeUserName))
@@ -211,6 +219,7 @@ func SourcesReadWriteGrantMatcher(ctx context.Context, priv *GrantPrivilege, clu
 			querybuilder.NewField("user_name"),
 			querybuilder.NewField("role_name"),
 			querybuilder.NewField("grant_option"),
+			querybuilder.NewField("is_partial_revoke"),
 		},
 		"system.grants",
 	).WithCluster(clusterName).Where(where...).Build()
@@ -314,7 +323,8 @@ func (i *impl) GetAllGrantsForGrantee(ctx context.Context, granteeUsername *stri
 		querybuilder.NewField("user_name"),
 		querybuilder.NewField("role_name"),
 		querybuilder.NewField("grant_option"),
-	}, "system.grants").WithCluster(clusterName).Where(to).Build()
+		querybuilder.NewField("is_partial_revoke"),
+	}, "system.grants").WithCluster(clusterName).Where(to, querybuilder.WhereEquals("is_partial_revoke", 0)).Build()
 	if err != nil {
 		return nil, errors.WithMessage(err, "error building query")
 	}
@@ -350,6 +360,10 @@ func (i *impl) GetAllGrantsForGrantee(ctx context.Context, granteeUsername *stri
 		if err != nil {
 			return errors.WithMessage(err, "error scanning query result, missing 'grant_option' field")
 		}
+		isPartialRevoke, err := data.GetBool("is_partial_revoke")
+		if err != nil {
+			return errors.WithMessage(err, "error scanning query result, missing 'is_partial_revoke' field")
+		}
 
 		ret = append(ret, GrantPrivilege{
 			AccessType:      accessType,
@@ -359,6 +373,7 @@ func (i *impl) GetAllGrantsForGrantee(ctx context.Context, granteeUsername *stri
 			GranteeUserName: granteeUserName,
 			GranteeRoleName: granteeRoleName,
 			GrantOption:     grantOption,
+			IsPartialRevoke: isPartialRevoke,
 		})
 
 		return nil

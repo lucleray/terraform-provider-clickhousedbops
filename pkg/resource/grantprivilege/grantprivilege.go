@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -40,6 +41,8 @@ func NewResource() resource.Resource {
 type Resource struct {
 	client dbops.Client
 }
+
+var grantPrivilegeMutationMu sync.Mutex
 
 func (r *Resource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_grant_privilege"
@@ -283,6 +286,9 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 		GrantOption:         plan.GrantOption.ValueBool(),
 	}
 
+	grantPrivilegeMutationMu.Lock()
+	defer grantPrivilegeMutationMu.Unlock()
+
 	createdGrant, err := r.client.GrantPrivilege(ctx, grant, plan.ClusterName.ValueStringPointer())
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -405,12 +411,45 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 		return
 	}
 
-	err := r.client.RevokeGrantPrivilege(ctx, state.Privilege.ValueString(), state.Database.ValueStringPointer(), state.Table.ValueStringPointer(), state.Column.ValueStringPointer(), state.GranteeUserName.ValueStringPointer(), state.GranteeRoleName.ValueStringPointer(), state.ClusterName.ValueStringPointer())
+	grantPrivilegeMutationMu.Lock()
+	defer grantPrivilegeMutationMu.Unlock()
+
+	existing, err := r.client.GetAllGrantsForGrantee(ctx, state.GranteeUserName.ValueStringPointer(), state.GranteeRoleName.ValueStringPointer(), state.ClusterName.ValueStringPointer())
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error Checking ClickHouse Privilege Grants",
+			"Could not check existing privilege grants before deletion, unexpected error: "+err.Error(),
+		)
+		return
+	}
+
+	grantsToReapply := make([]dbops.GrantPrivilege, 0)
+	for _, grant := range existing {
+		if shouldReapplyAfterRevoke(state, grant) {
+			grantsToReapply = append(grantsToReapply, grant)
+		}
+	}
+
+	err = r.client.RevokeGrantPrivilege(ctx, state.Privilege.ValueString(), state.Database.ValueStringPointer(), state.Table.ValueStringPointer(), state.Column.ValueStringPointer(), state.GranteeUserName.ValueStringPointer(), state.GranteeRoleName.ValueStringPointer(), state.ClusterName.ValueStringPointer())
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Deleting ClickHouse Privilege Grant",
 			"Could not delete privilege grant, unexpected error: "+err.Error(),
 		)
 		return
+	}
+
+	upstrGrts := parsedGrants()
+	for _, grant := range grantsToReapply {
+		// Re-applying broader grants clears ClickHouse partial revokes created by the narrower REVOKE.
+		grant.ExpandedAccessTypes = AllDescendants(upstrGrts.Groups, grant.AccessType)
+		_, err = r.client.GrantPrivilege(ctx, grant, state.ClusterName.ValueStringPointer())
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Restoring ClickHouse Privilege Grant",
+				"Could not restore broader privilege grant after deletion, unexpected error: "+err.Error(),
+			)
+			return
+		}
 	}
 }
